@@ -1,0 +1,33 @@
+[package]
+name = "taugpt_kvcache_bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+env_logger = "0.11.8"
+log = "0.4.28"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+csv = "1"
+sysinfo = "0.33"
+cpu-time = "1"
+rand = "0.8"
+burn = { version = "0.18.0", default-features = false, features = ["std", "train"] }
+tauformer = { version = "0.1.0", path = "../tauformer", features = ["burn-wgpu"]}
+sprs = "0.11"
+
+
+[[bin]]
+name = "taugpt_kvcache_bench"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1  # Faster dev builds
