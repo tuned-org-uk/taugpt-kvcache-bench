@@ -45,11 +45,6 @@ struct Args {
     #[arg(long, default_value = "1024,2048,4096,8000")]
     gen_tokens: String,
 
-    /// Comma-separated embedding multipliers (e.g., "1,2,3").
-    /// Each multiplier m sets n_embd = m * manifold_dim and n_head = m.
-    #[arg(long, default_value = "1,2,3")]
-    embd_multipliers: String,
-
     /// Limit how many prompts from the JSONL to run (0 = all).
     #[arg(long, default_value_t = 3)]
     max_prompts: usize,
@@ -70,9 +65,13 @@ struct Args {
     #[arg(long, default_value = "median")]
     tau_mode: String,
 
-    /// KV heads strategy: "1" (extreme MQA) or "match" (n_kv_head = n_head)
-    #[arg(long, default_value = "1")]
-    kv_head_strategy: String,
+    /// Heads for NanoGPT config (keep n_embd = n_head * manifold_dim)
+    #[arg(long, default_value_t = 1)]
+    n_head: usize,
+
+    /// KV heads for NanoGPT config
+    #[arg(long, default_value_t = 1)]
+    n_kv_head: usize,
 
     /// Layers for both models
     #[arg(long, default_value_t = 6)]
@@ -224,9 +223,6 @@ fn greedy_next_id(logits_step: Tensor<B, 3>) -> Tensor<B, 2, Int> {
 struct BenchOut {
     prompt_len: usize,
     gen_tokens: usize,
-    embd_mult: usize,
-    n_embd: usize,
-    n_head: usize,
 
     prefill_ms: f64,
     prime_ms: f64,
@@ -298,9 +294,6 @@ fn bench_nanogpt(
     prompt: &PromptRow,
     mode: Mode,
     max_new_tokens: usize,
-    embd_mult: usize,
-    n_embd: usize,
-    n_head: usize,
     sys: &mut System,
     pid: Pid,
 ) -> Result<BenchOut> {
@@ -309,14 +302,11 @@ fn bench_nanogpt(
     }
 
     log::debug!(
-        "bench_nanogpt: enter prompt_id={} prompt_len={} mode={:?} max_new_tokens={} embd_mult={} n_embd={} n_head={}",
+        "bench_nanogpt: enter prompt_id={} prompt_len={} mode={:?} max_new_tokens={}",
         prompt.id,
         prompt.tokens.len(),
         mode,
-        max_new_tokens,
-        embd_mult,
-        n_embd,
-        n_head
+        max_new_tokens
     );
 
     let rss_before = current_rss_mb(sys, pid);
@@ -397,9 +387,6 @@ fn bench_nanogpt(
             Ok(BenchOut {
                 prompt_len,
                 gen_tokens: max_new_tokens,
-                embd_mult,
-                n_embd,
-                n_head,
                 prefill_ms: 0.0,
                 prime_ms: 0.0,
                 ttft_ms,
@@ -497,9 +484,6 @@ fn bench_nanogpt(
             Ok(BenchOut {
                 prompt_len,
                 gen_tokens: max_new_tokens,
-                embd_mult,
-                n_embd,
-                n_head,
                 prefill_ms,
                 prime_ms: 0.0,
                 ttft_ms,
@@ -525,9 +509,6 @@ fn bench_taugpt(
     prompt: &PromptRow,
     mode: Mode,
     max_new_tokens: usize,
-    embd_mult: usize,
-    n_embd: usize,
-    n_head: usize,
     sys: &mut System,
     pid: Pid,
 ) -> Result<BenchOut> {
@@ -536,14 +517,11 @@ fn bench_taugpt(
     }
 
     log::debug!(
-        "bench_taugpt: enter prompt_id={} prompt_len={} mode={:?} max_new_tokens={} embd_mult={} n_embd={} n_head={}",
+        "bench_taugpt: enter prompt_id={} prompt_len={} mode={:?} max_new_tokens={}",
         prompt.id,
         prompt.tokens.len(),
         mode,
-        max_new_tokens,
-        embd_mult,
-        n_embd,
-        n_head
+        max_new_tokens
     );
 
     let rss_before = current_rss_mb(sys, pid);
@@ -619,9 +597,6 @@ fn bench_taugpt(
             Ok(BenchOut {
                 prompt_len,
                 gen_tokens: max_new_tokens,
-                embd_mult,
-                n_embd,
-                n_head,
                 prefill_ms: 0.0,
                 prime_ms: 0.0,
                 ttft_ms,
@@ -719,9 +694,6 @@ fn bench_taugpt(
             Ok(BenchOut {
                 prompt_len,
                 gen_tokens: max_new_tokens,
-                embd_mult,
-                n_embd,
-                n_head,
                 prefill_ms,
                 prime_ms: 0.0,
                 ttft_ms,
@@ -748,9 +720,6 @@ fn write_headers(runs_w: &mut Writer<File>, tok_w: &mut Writer<File>) -> Result<
         "prompt_id",
         "prompt_len",
         "gen_tokens",
-        "embd_mult",
-        "n_embd",
-        "n_head",
         "prefill_ms",
         "prime_ms",
         "ttft_ms",
@@ -769,7 +738,6 @@ fn write_headers(runs_w: &mut Writer<File>, tok_w: &mut Writer<File>) -> Result<
         "engine",
         "mode",
         "prompt_id",
-        "embd_mult",
         "token_index",
         "token_ms",
     ])?;
@@ -822,15 +790,6 @@ fn main() -> Result<()> {
         gt
     };
 
-    let embd_multipliers = {
-        let em = parse_usize_list(&args.embd_multipliers)?;
-        if em.iter().any(|&m| m == 0) {
-            return Err(anyhow!("embd_multipliers must be >= 1"));
-        }
-        log::info!("main: embd_multipliers sweep = {:?}", em);
-        em
-    };
-
     // Manifold/config
     let manifold_path = PathBuf::from(&args.manifold);
     log::info!("main: loading manifold from {}", manifold_path.display());
@@ -838,6 +797,15 @@ fn main() -> Result<()> {
     let manifold = load_domain_manifold(&manifold_path)?;
     let manifold_dim = manifold.nfeatures;
     log::info!("main: manifold_dim (nfeatures) = {}", manifold_dim);
+
+    if args.n_head == 0 || args.n_kv_head == 0 {
+        return Err(anyhow!("n_head and n_kv_head must be >= 1"));
+    }
+    if args.n_kv_head > args.n_head || (args.n_head % args.n_kv_head != 0) {
+        return Err(anyhow!(
+            "invalid MQA config: require n_kv_head <= n_head and n_head % n_kv_head == 0"
+        ));
+    }
 
     let max_prompt_len = *prompt_lens.iter().max().unwrap();
     let max_new_tokens = *gen_tokens.iter().max().unwrap();
@@ -860,6 +828,26 @@ fn main() -> Result<()> {
         "main: max_token_id={} -> vocab_size={}",
         max_token_id,
         vocab_size
+    );
+
+    let cfg = NanoChatConfig {
+        sequence_len: seq_len,
+        vocab_size,
+        n_layer: args.n_layer,
+        n_head: args.n_head,
+        n_kv_head: args.n_kv_head,
+        n_embd: args.n_head * manifold_dim,
+        block_size: seq_len,
+        dropout: 0.0,
+    };
+    log::info!(
+        "main: cfg sequence_len={} vocab_size={} n_layer={} n_head={} n_kv_head={} n_embd={}",
+        cfg.sequence_len,
+        cfg.vocab_size,
+        cfg.n_layer,
+        cfg.n_head,
+        cfg.n_kv_head,
+        cfg.n_embd
     );
 
     let device = get_device();
@@ -887,219 +875,133 @@ fn main() -> Result<()> {
     let pid = Pid::from(std::process::id() as usize);
     log::info!("main: pid={:?}", pid);
 
+    // Build models once (cfg supports max sweep)
+    let nano = if args.run_nano {
+        log::info!("main: building NanoModel...");
+        let m = NanoModel::<B>::new(&cfg, &device);
+        log::info!("main: NanoModel built");
+        Some(m)
+    } else {
+        log::info!("main: NanoModel disabled");
+        None
+    };
+
+    let tau = if args.run_tau {
+        log::info!("main: building TauGptModel (sparse laplacian)...");
+        let m =
+            TauGptModel::<B>::new_with_sparse_laplacian(&cfg, &manifold_path, &device, tau_mode);
+        log::info!("main: TauGptModel built");
+        Some(m)
+    } else {
+        log::info!("main: TauGptModel disabled");
+        None
+    };
+
     let modes = [Mode::NoCache, Mode::KvCache];
     let mut run_id: u64 = 0;
 
-    // Outer loop: embedding multiplier
-    for &embd_mult in &embd_multipliers {
-        let n_embd = embd_mult * manifold_dim;
-        let n_head = embd_mult;
-        let n_kv_head = match args.kv_head_strategy.as_str() {
-            "1" => 1,
-            "match" => n_head,
-            other => {
-                return Err(anyhow!(
-                    "unknown --kv-head-strategy '{other}' (use '1' or 'match')"
-                ));
-            }
-        };
+    for &pl in &prompt_lens {
+        log::info!("main: ===== prompt_len={} =====", pl);
 
-        // Validate MQA constraint
-        if n_kv_head > n_head || (n_head % n_kv_head != 0) {
-            return Err(anyhow!(
-                "invalid MQA config: embd_mult={} n_head={} n_kv_head={} (require n_kv_head <= n_head and n_head % n_kv_head == 0)",
-                embd_mult,
-                n_head,
-                n_kv_head
-            ));
-        }
-
-        let head_dim = n_embd / n_head;
-        if head_dim != manifold_dim {
-            return Err(anyhow!(
-                "invariant violation: head_dim={} != manifold_dim={} (embd_mult={} n_embd={} n_head={})",
-                head_dim,
-                manifold_dim,
-                embd_mult,
-                n_embd,
-                n_head
-            ));
-        }
-
+        // Materialize prompt variants at this prompt_len
+        let prompts_pl: Vec<PromptRow> =
+            prompts.iter().map(|p| materialize_prompt(p, pl)).collect();
         log::info!(
-            "main: ===== EMBEDDING MULTIPLIER {} ===== (n_embd={} n_head={} n_kv_head={} head_dim={})",
-            embd_mult,
-            n_embd,
-            n_head,
-            n_kv_head,
-            head_dim
+            "main: materialized {} prompts at len={}",
+            prompts_pl.len(),
+            pl
         );
 
-        let cfg = NanoChatConfig {
-            sequence_len: seq_len,
-            vocab_size,
-            n_layer: args.n_layer,
-            n_head,
-            n_kv_head,
-            n_embd,
-            block_size: seq_len,
-            dropout: 0.0,
-        };
-        log::info!(
-            "main: cfg sequence_len={} vocab_size={} n_layer={} n_head={} n_kv_head={} n_embd={}",
-            cfg.sequence_len,
-            cfg.vocab_size,
-            cfg.n_layer,
-            cfg.n_head,
-            cfg.n_kv_head,
-            cfg.n_embd
-        );
+        for &gt in &gen_tokens {
+            log::info!("main: ---- gen_tokens={} ----", gt);
 
-        // Build models for this embedding config
-        let nano = if args.run_nano {
-            log::info!("main: building NanoModel (embd_mult={})...", embd_mult);
-            let m = NanoModel::<B>::new(&cfg, &device);
-            log::info!("main: NanoModel built");
-            Some(m)
-        } else {
-            log::info!("main: NanoModel disabled");
-            None
-        };
+            for p in &prompts_pl {
+                log::info!("main: prompt_id={} prompt_len={}", p.id, p.tokens.len());
 
-        let tau = if args.run_tau {
-            log::info!(
-                "main: building TauGptModel (embd_mult={}, sparse laplacian)...",
-                embd_mult
-            );
-            let m = TauGptModel::<B>::new_with_sparse_laplacian(
-                &cfg,
-                &manifold_path,
-                &device,
-                tau_mode,
-            );
-            log::info!("main: TauGptModel built");
-            Some(m)
-        } else {
-            log::info!("main: TauGptModel disabled");
-            None
-        };
+                for &m in &modes {
+                    let mode_str = match m {
+                        Mode::NoCache => "no_cache",
+                        Mode::KvCache => "kv_cache",
+                    };
+                    log::info!("main: mode={}", mode_str);
 
-        // Loop over prompt_lens
-        for &pl in &prompt_lens {
-            log::info!("main: ----- prompt_len={} -----", pl);
+                    if let Some(nano) = nano.as_ref() {
+                        run_id += 1;
+                        log::info!("main: run_id={} engine=nano", run_id);
 
-            // Materialize prompt variants at this prompt_len
-            let prompts_pl: Vec<PromptRow> =
-                prompts.iter().map(|p| materialize_prompt(p, pl)).collect();
-            log::info!(
-                "main: materialized {} prompts at len={}",
-                prompts_pl.len(),
-                pl
-            );
+                        let out = bench_nanogpt(nano, &device, p, m, gt, &mut sys, pid)?;
+                        runs_w.write_record([
+                            run_id.to_string(),
+                            "nano".to_string(),
+                            mode_str.to_string(),
+                            p.id.clone(),
+                            out.prompt_len.to_string(),
+                            out.gen_tokens.to_string(),
+                            format!("{:.4}", out.prefill_ms),
+                            format!("{:.4}", out.prime_ms),
+                            format!("{:.4}", out.ttft_ms),
+                            format!("{:.4}", out.decode_total_ms),
+                            format!("{:.4}", out.tokens_per_sec),
+                            format!("{:.4}", out.decode_tokens_per_sec),
+                            format!("{:.4}", out.end_to_end_ms),
+                            format!("{:.4}", out.p50_token_ms),
+                            format!("{:.4}", out.p95_token_ms),
+                            format!("{:.4}", out.rss_before_mb),
+                            format!("{:.4}", out.rss_after_mb),
+                        ])?;
 
-            for &gt in &gen_tokens {
-                log::info!("main: ---- gen_tokens={} ----", gt);
-
-                for p in &prompts_pl {
-                    log::info!("main: prompt_id={} prompt_len={}", p.id, p.tokens.len());
-
-                    for &m in &modes {
-                        let mode_str = match m {
-                            Mode::NoCache => "no_cache",
-                            Mode::KvCache => "kv_cache",
-                        };
-                        log::info!("main: mode={}", mode_str);
-
-                        if let Some(nano) = nano.as_ref() {
-                            run_id += 1;
-                            log::info!("main: run_id={} engine=nano", run_id);
-
-                            let out = bench_nanogpt(
-                                nano, &device, p, m, gt, embd_mult, n_embd, n_head, &mut sys, pid,
-                            )?;
-                            runs_w.write_record([
+                        for (i, ms) in out.per_token_ms.iter().enumerate() {
+                            tok_w.write_record([
                                 run_id.to_string(),
                                 "nano".to_string(),
                                 mode_str.to_string(),
                                 p.id.clone(),
-                                out.prompt_len.to_string(),
-                                out.gen_tokens.to_string(),
-                                out.embd_mult.to_string(),
-                                out.n_embd.to_string(),
-                                out.n_head.to_string(),
-                                format!("{:.4}", out.prefill_ms),
-                                format!("{:.4}", out.prime_ms),
-                                format!("{:.4}", out.ttft_ms),
-                                format!("{:.4}", out.decode_total_ms),
-                                format!("{:.4}", out.tokens_per_sec),
-                                format!("{:.4}", out.decode_tokens_per_sec),
-                                format!("{:.4}", out.end_to_end_ms),
-                                format!("{:.4}", out.p50_token_ms),
-                                format!("{:.4}", out.p95_token_ms),
-                                format!("{:.4}", out.rss_before_mb),
-                                format!("{:.4}", out.rss_after_mb),
+                                i.to_string(),
+                                format!("{:.6}", ms),
                             ])?;
-
-                            for (i, ms) in out.per_token_ms.iter().enumerate() {
-                                tok_w.write_record([
-                                    run_id.to_string(),
-                                    "nano".to_string(),
-                                    mode_str.to_string(),
-                                    p.id.clone(),
-                                    out.embd_mult.to_string(),
-                                    i.to_string(),
-                                    format!("{:.6}", ms),
-                                ])?;
-                            }
                         }
+                    }
 
-                        if let Some(tau) = tau.as_ref() {
-                            run_id += 1;
-                            log::info!("main: run_id={} engine=tau", run_id);
+                    if let Some(tau) = tau.as_ref() {
+                        run_id += 1;
+                        log::info!("main: run_id={} engine=tau", run_id);
 
-                            let out = bench_taugpt(
-                                tau, &device, p, m, gt, embd_mult, n_embd, n_head, &mut sys, pid,
-                            )?;
-                            runs_w.write_record([
+                        let out = bench_taugpt(tau, &device, p, m, gt, &mut sys, pid)?;
+                        runs_w.write_record([
+                            run_id.to_string(),
+                            "tau".to_string(),
+                            mode_str.to_string(),
+                            p.id.clone(),
+                            out.prompt_len.to_string(),
+                            out.gen_tokens.to_string(),
+                            format!("{:.4}", out.prefill_ms),
+                            format!("{:.4}", out.prime_ms),
+                            format!("{:.4}", out.ttft_ms),
+                            format!("{:.4}", out.decode_total_ms),
+                            format!("{:.4}", out.tokens_per_sec),
+                            format!("{:.4}", out.decode_tokens_per_sec),
+                            format!("{:.4}", out.end_to_end_ms),
+                            format!("{:.4}", out.p50_token_ms),
+                            format!("{:.4}", out.p95_token_ms),
+                            format!("{:.4}", out.rss_before_mb),
+                            format!("{:.4}", out.rss_after_mb),
+                        ])?;
+
+                        for (i, ms) in out.per_token_ms.iter().enumerate() {
+                            tok_w.write_record([
                                 run_id.to_string(),
                                 "tau".to_string(),
                                 mode_str.to_string(),
                                 p.id.clone(),
-                                out.prompt_len.to_string(),
-                                out.gen_tokens.to_string(),
-                                out.embd_mult.to_string(),
-                                out.n_embd.to_string(),
-                                out.n_head.to_string(),
-                                format!("{:.4}", out.prefill_ms),
-                                format!("{:.4}", out.prime_ms),
-                                format!("{:.4}", out.ttft_ms),
-                                format!("{:.4}", out.decode_total_ms),
-                                format!("{:.4}", out.tokens_per_sec),
-                                format!("{:.4}", out.decode_tokens_per_sec),
-                                format!("{:.4}", out.end_to_end_ms),
-                                format!("{:.4}", out.p50_token_ms),
-                                format!("{:.4}", out.p95_token_ms),
-                                format!("{:.4}", out.rss_before_mb),
-                                format!("{:.4}", out.rss_after_mb),
+                                i.to_string(),
+                                format!("{:.6}", ms),
                             ])?;
-
-                            for (i, ms) in out.per_token_ms.iter().enumerate() {
-                                tok_w.write_record([
-                                    run_id.to_string(),
-                                    "tau".to_string(),
-                                    mode_str.to_string(),
-                                    p.id.clone(),
-                                    out.embd_mult.to_string(),
-                                    i.to_string(),
-                                    format!("{:.6}", ms),
-                                ])?;
-                            }
                         }
-
-                        runs_w.flush()?;
-                        tok_w.flush()?;
-                        log::debug!("main: flushed CSV writers (run_id={})", run_id);
                     }
+
+                    runs_w.flush()?;
+                    tok_w.flush()?;
+                    log::debug!("main: flushed CSV writers (run_id={})", run_id);
                 }
             }
         }

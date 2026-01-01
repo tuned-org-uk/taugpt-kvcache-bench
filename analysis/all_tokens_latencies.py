@@ -69,7 +69,7 @@ def infer_gen_tokens(df: pd.DataFrame) -> pd.DataFrame:
     df["token_index"] = pd.to_numeric(df["token_index"], errors="coerce")
 
     # Keys without variant
-    keys = ["engine", "mode", "prompt_id", "run_id"]
+    keys = ["prompt_id", "mode", "prompt_len", "gen_tokens", "token_index"]
 
     # Only use rows with valid token_index for inference
     base = df.dropna(subset=keys + ["token_index"]).copy()
