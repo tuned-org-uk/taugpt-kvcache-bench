@@ -3,10 +3,13 @@
 Plot token-latency analysis from tokenlatencies__normalized.csv
 
 Produces:
-  - speedup_vs_gen_tokens.png: tau advantage in kv_cache grows with sequence length
+  - speedup_vs_gentokens.png: tau advantage in kv_cache grows with sequence length
   - speedup_by_relpos_bins.png: per-token speedup by relative position in sequence
   - run_clusters_pca.png: clustering runs by latency distribution features
   - CSV summaries and cluster counts
+
+Usage:
+    python all_tokens_latencies.py --tokencsv tokenlatencies__normalized.csv --outdir plots/tokenlat
 """
 
 import argparse
@@ -19,8 +22,8 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-POS_BINS = np.array([0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 1.0000001])
-POS_BIN_LABELS = ["0-10%", "10-25%", "25-50%", "50-75%", "75-90%", "90-100%"]
+POSBINS = np.array([0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 1.0000001])
+POSBINLABELS = ["0-10%", "10-25%", "25-50%", "50-75%", "75-90%", "90-100%"]
 
 
 def ensure_dir(path: str):
@@ -35,19 +38,15 @@ def safe_percentile(x, q):
 
 
 def fit_line_log2x(x, y):
-    """
-    Fit y = a + b*log2(x). Returns (a, b).
-    """
+    """Fit y = a + b*log2(x). Returns a, b."""
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     m = np.isfinite(x) & np.isfinite(y) & (x > 0)
     if m.sum() < 2:
-        return (np.nan, np.nan)
+        return np.nan, np.nan
     lx = np.log2(x[m])
     b, a = np.polyfit(lx, y[m], 1)
-    # polyfit returns [slope, intercept] for lx->y, so y = b*lx + a
-    # We want y = a + b*log2(x), so return (a, b)
-    return (a, b)
+    return a, b
 
 
 def predict_line_log2x(a_intercept, b_slope, x):
@@ -55,62 +54,79 @@ def predict_line_log2x(a_intercept, b_slope, x):
     return a_intercept + b_slope * np.log2(x)
 
 
-def infer_gen_tokens(df: pd.DataFrame) -> pd.DataFrame:
+def ensure_gen_tokens(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Infer gen_tokens per (engine, mode, prompt_id, run_id) as max(token_index)+1.
+    Ensure gen_tokens column exists.
+    If it already exists, use it. Otherwise infer from max(token_index)+1.
+    """
+    if "gen_tokens" in df.columns:
+        print("  gen_tokens column already exists, using it")
+        df["gen_tokens"] = pd.to_numeric(df["gen_tokens"], errors="coerce").astype(
+            "Int64"
+        )
+        return df
 
-    - Drops 'variant' from grouping keys (user requested; may be constant).
-    - Coerces token_index to numeric and drops rows where it's missing.
-    - Avoids int-casting until NaNs are removed.
-    """
+    print("  Inferring gen_tokens from token_index...")
     df = df.copy()
-
-    # Ensure token_index is numeric
     df["token_index"] = pd.to_numeric(df["token_index"], errors="coerce")
 
-    # Keys without variant
-    keys = ["prompt_id", "mode", "prompt_len", "gen_tokens", "token_index"]
+    # Build key list without duplicates
+    available_keys = []
+    key_names = ["prompt_id", "run_id", "engine", "mode", "experiment"]
+    for wanted in key_names:
+        if wanted in df.columns:
+            available_keys.append(wanted)
 
-    # Only use rows with valid token_index for inference
-    base = df.dropna(subset=keys + ["token_index"]).copy()
+    if not available_keys:
+        raise ValueError(
+            f"Cannot infer gen_tokens: no key columns found. Available: {df.columns.tolist()}"
+        )
+
+    print(f"  Using keys: {available_keys}")
+
+    base = df.dropna(subset=available_keys + ["token_index"]).copy()
+    if base.empty:
+        raise ValueError("No valid rows after dropna")
 
     g = (
-        base.groupby(keys, as_index=False)["token_index"]
+        base.groupby(available_keys, as_index=False)["token_index"]
         .max()
         .rename(columns={"token_index": "token_index_max"})
     )
 
-    # gen_tokens = max_index + 1 (keep as float until validation)
-    g["gen_tokens"] = g["token_index_max"] + 1.0
+    if g.empty:
+        raise ValueError("Groupby returned empty result")
 
-    # Drop any non-finite gen_tokens
-    g = g[np.isfinite(g["gen_tokens"])].copy()
+    g["gen_tokens"] = (g["token_index_max"] + 1.0).round().astype("Int64")
+    g = g.drop(columns=["token_index_max"])
 
-    # Now safe to cast
-    g["gen_tokens"] = g["gen_tokens"].round().astype("int64")
-
-    # Merge back
-    df = df.merge(g[keys + ["gen_tokens"]], on=keys, how="left")
-
-    # Drop rows where gen_tokens couldn't be inferred
     before = len(df)
+    df = df.merge(g, on=available_keys, how="left")
+
+    if "gen_tokens" not in df.columns:
+        raise ValueError("Merge did not produce gen_tokens column")
+
     df = df.dropna(subset=["gen_tokens"]).copy()
     after = len(df)
     if after < before:
-        print(f"Warning: dropped {before - after} rows with missing gen_tokens")
+        print(f"  Dropped {before - after} rows with missing gen_tokens")
 
     df["gen_tokens"] = df["gen_tokens"].astype("int64")
-
     return df
 
 
 def add_relpos_bins(df: pd.DataFrame) -> pd.DataFrame:
+    """Add relative position bins if not already present."""
+    if "relpos_bin" in df.columns:
+        print("  relpos_bin already exists, skipping")
+        return df
+
     df = df.copy()
-    df["rel_pos"] = df["token_index"] / df["gen_tokens"]
-    df["pos_bin"] = pd.cut(
-        df["rel_pos"].clip(0, 1),
-        bins=POS_BINS,
-        labels=POS_BIN_LABELS,
+    df["relpos"] = df["token_index"] / df["gen_tokens"]
+    df["posbin"] = pd.cut(
+        df["relpos"].clip(0, 1),
+        bins=POSBINS,
+        labels=POSBINLABELS,
         include_lowest=True,
         right=True,
     )
@@ -119,9 +135,7 @@ def add_relpos_bins(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_matched_speedups(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute per-token speedup (nano_ms / tau_ms) by matching tokens on:
-      (prompt_id, mode, gen_tokens, token_index)
-    Then return the joined DataFrame with speedup column.
+    Compute per-token speedup (nano_ms / tau_ms) by matching tokens.
     """
     keys = ["prompt_id", "mode", "gen_tokens", "token_index"]
 
@@ -131,17 +145,13 @@ def compute_matched_speedups(df: pd.DataFrame) -> pd.DataFrame:
     tau = df[df["engine"] == "tau"][keys + ["token_ms"]].rename(
         columns={"token_ms": "tau_token_ms"}
     )
-
     j = nano.merge(tau, on=keys, how="inner")
     j["speedup_nano_over_tau"] = j["nano_token_ms"] / j["tau_token_ms"]
     return j
 
 
 def summarize_speedups(speedups: pd.DataFrame) -> pd.DataFrame:
-    """
-    Summarize per-token speedup distributions by (mode, gen_tokens).
-    Returns flat DataFrame.
-    """
+    """Summarize per-token speedup distributions by mode, gen_tokens."""
     out = speedups.groupby(["mode", "gen_tokens"], as_index=False).agg(
         pairs=("speedup_nano_over_tau", "size"),
         speedup_mean=("speedup_nano_over_tau", "mean"),
@@ -156,12 +166,11 @@ def summarize_speedups(speedups: pd.DataFrame) -> pd.DataFrame:
 
 
 def summarize_speedups_by_posbin(speedups_with_bins: pd.DataFrame) -> pd.DataFrame:
-    """
-    Summarize speedups by relative position bin for each (mode, gen_tokens).
-    """
-    g = speedups_with_bins.groupby(
-        ["mode", "gen_tokens", "pos_bin"], as_index=False
-    ).agg(
+    """Summarize speedups by relative position bin for each mode, gen_tokens."""
+    # Use posbin if it exists, otherwise relpos_bin
+    bin_col = "posbin" if "posbin" in speedups_with_bins.columns else "relpos_bin"
+
+    g = speedups_with_bins.groupby(["mode", "gen_tokens", bin_col], as_index=False).agg(
         pairs=("speedup_nano_over_tau", "size"),
         p50=("speedup_nano_over_tau", lambda s: safe_percentile(s, 50)),
         p95=("speedup_nano_over_tau", lambda s: safe_percentile(s, 95)),
@@ -169,14 +178,16 @@ def summarize_speedups_by_posbin(speedups_with_bins: pd.DataFrame) -> pd.DataFra
         mean=("speedup_nano_over_tau", "mean"),
     )
     g["pairs"] = g["pairs"].astype(int)
+
+    # Rename back to posbin for consistency
+    if bin_col == "relpos_bin":
+        g = g.rename(columns={"relpos_bin": "posbin"})
+
     return g
 
 
 def compute_run_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build per-run distribution features for clustering runs.
-    Run is keyed by (engine, mode, prompt_id, run_id, gen_tokens).
-    """
+    """Build per-run distribution features for clustering."""
     keys = ["engine", "mode", "prompt_id", "run_id", "gen_tokens"]
 
     feat = df.groupby(keys, as_index=False).agg(
@@ -187,7 +198,7 @@ def compute_run_features(df: pd.DataFrame) -> pd.DataFrame:
         token_ms_std=("token_ms", "std"),
     )
 
-    # Compute slope separately per group
+    # Compute slope of token_ms vs relative position
     def slope_vs_relpos(sub):
         x = sub["token_index"].to_numpy(dtype=float) / float(sub["gen_tokens"].iloc[0])
         y = sub["token_ms"].to_numpy(dtype=float)
@@ -199,8 +210,8 @@ def compute_run_features(df: pd.DataFrame) -> pd.DataFrame:
     slopes = []
     for keys_vals, sub in df.groupby(keys):
         slopes.append(slope_vs_relpos(sub))
-    feat["slope_ms_per_relpos"] = slopes
 
+    feat["slope_ms_per_relpos"] = slopes
     return feat
 
 
@@ -214,6 +225,7 @@ def cluster_runs(run_feat: pd.DataFrame, k: int, seed: int) -> pd.DataFrame:
         "slope_ms_per_relpos",
     ]
     X = run_feat[cols].to_numpy(dtype=float)
+
     # Replace NaNs with column medians
     col_meds = np.nanmedian(X, axis=0)
     inds = np.where(~np.isfinite(X))
@@ -235,7 +247,7 @@ def cluster_runs(run_feat: pd.DataFrame, k: int, seed: int) -> pd.DataFrame:
     return out
 
 
-def plot_speedup_vs_gen(summary: pd.DataFrame, outdir: str, max_gen: int):
+def plot_speedup_vs_gen(summary: pd.DataFrame, outdir: str, maxgen: int):
     ensure_dir(outdir)
     plt.figure(figsize=(10, 6))
 
@@ -246,9 +258,8 @@ def plot_speedup_vs_gen(summary: pd.DataFrame, outdir: str, max_gen: int):
 
         x = s["gen_tokens"].to_numpy()
         y = s["speedup_p50"].to_numpy()
-
         plt.plot(
-            x, y, "o-", color=color, linewidth=2, markersize=8, label=f"{mode} (p50)"
+            x, y, "o-", color=color, linewidth=2, markersize=8, label=f"{mode} p50"
         )
         plt.fill_between(
             x,
@@ -259,10 +270,10 @@ def plot_speedup_vs_gen(summary: pd.DataFrame, outdir: str, max_gen: int):
             linewidth=0,
         )
 
-        # Interpolation/extrapolation in log2 space
+        # Extrapolation
         a, b = fit_line_log2x(x, y)
         if np.isfinite(a) and np.isfinite(b):
-            xs = np.geomspace(x.min(), max_gen, 100)
+            xs = np.geomspace(x.min(), maxgen, 100)
             ys = predict_line_log2x(a, b, xs)
             plt.plot(
                 xs,
@@ -271,7 +282,7 @@ def plot_speedup_vs_gen(summary: pd.DataFrame, outdir: str, max_gen: int):
                 color=color,
                 alpha=0.7,
                 linewidth=1.5,
-                label=f"{mode} extrapolation (y={a:.2f}+{b:.3f}*log2(x))",
+                label=f"{mode} extrapolation: y={a:.2f}+{b:.3f}*log2(x)",
             )
 
     plt.axhline(
@@ -284,22 +295,22 @@ def plot_speedup_vs_gen(summary: pd.DataFrame, outdir: str, max_gen: int):
     )
     plt.xscale("log", base=2)
     plt.xlabel("gen_tokens (log2 scale)", fontsize=12)
-    plt.ylabel("Per-token speedup = nano_token_ms / tau_token_ms", fontsize=12)
+    plt.ylabel("Per-token speedup (nano_token_ms / tau_token_ms)", fontsize=12)
     plt.title(
-        "Tau per-token advantage grows with sequence length in kv_cache;\nno_cache remains <1 (tau slower)",
+        "Tau per-token advantage grows with sequence length in kv_cache;\n"
+        "no_cache remains ~1 (tau slower)",
         fontsize=13,
     )
     plt.legend(loc="best", fontsize=9)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(outdir, "speedup_vs_gen_tokens.png"), dpi=200)
+    plt.savefig(os.path.join(outdir, "speedup_vs_gentokens.png"), dpi=200)
     plt.close()
-    print(f"  → speedup_vs_gen_tokens.png")
+    print(f"  → speedup_vs_gentokens.png")
 
 
 def plot_speedup_by_posbin(speedup_posbin: pd.DataFrame, outdir: str):
     ensure_dir(outdir)
-
     modes = ["kv_cache", "no_cache"]
     fig, axes = plt.subplots(1, 2, figsize=(15, 5), sharey=True)
 
@@ -314,10 +325,10 @@ def plot_speedup_by_posbin(speedup_posbin: pd.DataFrame, outdir: str):
 
         for i, gt in enumerate(gen_tokens_vals):
             dd = d[d["gen_tokens"] == gt].copy()
-            dd["pos_bin"] = pd.Categorical(
-                dd["pos_bin"], categories=POS_BIN_LABELS, ordered=True
+            dd["posbin"] = pd.Categorical(
+                dd["posbin"], categories=POSBINLABELS, ordered=True
             )
-            dd = dd.sort_values("pos_bin")
+            dd = dd.sort_values("posbin")
 
             ax.plot(
                 np.arange(len(dd)),
@@ -330,14 +341,14 @@ def plot_speedup_by_posbin(speedup_posbin: pd.DataFrame, outdir: str):
             )
 
         ax.axhline(1.0, color="black", linewidth=1.5, linestyle=":", alpha=0.7)
-        ax.set_xticks(np.arange(len(POS_BIN_LABELS)))
-        ax.set_xticklabels(POS_BIN_LABELS, rotation=30, ha="right")
-        ax.set_title(f"{mode}: per-token speedup by decode position", fontsize=12)
+        ax.set_xticks(np.arange(len(POSBINLABELS)))
+        ax.set_xticklabels(POSBINLABELS, rotation=30, ha="right")
+        ax.set_title(f"{mode} per-token speedup by decode position", fontsize=12)
         ax.set_xlabel("Relative position bin", fontsize=11)
         ax.grid(True, alpha=0.3, axis="y")
         ax.legend(title="gen_tokens", loc="best", fontsize=8)
 
-    axes[0].set_ylabel("Per-token speedup = nano/tau (p50 within bin)", fontsize=11)
+    axes[0].set_ylabel("Per-token speedup (nano/tau, p50 within bin)", fontsize=11)
     plt.tight_layout()
     plt.savefig(os.path.join(outdir, "speedup_by_relpos_bins.png"), dpi=200)
     plt.close()
@@ -375,7 +386,8 @@ def plot_cluster_scatter(run_clusters: pd.DataFrame, outdir: str):
         )
 
     ax.set_title(
-        "Run clustering by token-latency distribution\n(PCA projection of mean/p50/p95/p99/std/slope features)",
+        "Run clustering by token-latency distribution\n"
+        "PCA projection of (mean/p50/p95/p99/std/slope) features",
         fontsize=12,
     )
     ax.set_xlabel("PCA1", fontsize=11)
@@ -395,6 +407,7 @@ def plot_cluster_scatter(run_clusters: pd.DataFrame, outdir: str):
     )
     ct.to_csv(os.path.join(outdir, "run_cluster_counts.csv"), index=False)
 
+    # Cluster counts bar chart
     fig, ax = plt.subplots(figsize=(11, 5))
     x = np.arange(len(ct))
     ax.bar(
@@ -402,7 +415,7 @@ def plot_cluster_scatter(run_clusters: pd.DataFrame, outdir: str):
     )
     ax.set_xticks(x)
     ax.set_xticklabels(
-        [f"c{r.cluster}·{r.engine}·{r.mode}" for r in ct.itertuples()],
+        [f"{r.cluster}/{r.engine}/{r.mode}" for r in ct.itertuples()],
         rotation=45,
         ha="right",
         fontsize=9,
@@ -418,65 +431,58 @@ def plot_cluster_scatter(run_clusters: pd.DataFrame, outdir: str):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Analyze tokenlatencies__normalized.csv and produce plots + extrapolations"
+        description="Analyze tokenlatencies__normalized.csv and produce plots/extrapolations"
     )
     ap.add_argument(
-        "--token_csv",
+        "--tokencsv",
         default="tokenlatencies__normalized.csv",
         help="Path to token latencies CSV",
     )
-    ap.add_argument("--outdir", default="plots_tokenlat", help="Output directory")
+    ap.add_argument("--outdir", default="plots/tokenlat", help="Output directory")
     ap.add_argument(
-        "--max_gen_tokens",
+        "--maxgentokens",
         type=int,
         default=8192,
         help="Extrapolate to this gen_tokens",
     )
     ap.add_argument(
-        "--clusters_k", type=int, default=6, help="Number of KMeans clusters"
+        "--clustersk", type=int, default=6, help="Number of KMeans clusters"
     )
     ap.add_argument("--seed", type=int, default=42, help="Random seed")
     args = ap.parse_args()
 
     ensure_dir(args.outdir)
 
-    print(f"Loading {args.token_csv}...")
-    # Simplified dtypes (no variant)
-    dtypes = {
-        "run_id": "int32",
-        "engine": "category",
-        "mode": "category",
-        "prompt_id": "category",
-        "token_index": "float32",  # keep float to handle parsing issues
-        "token_ms": "float32",
-    }
-    df = pd.read_csv(args.token_csv, dtype=dtypes)
+    print(f"Loading {args.tokencsv}...")
+    df = pd.read_csv(args.tokencsv, low_memory=False)
+
+    print(f"  Loaded {len(df)} rows")
 
     # Normalize string columns
-    for c in ["engine", "mode", "prompt_id"]:
+    for c in ["engine", "mode"]:
         if c in df.columns:
-            df[c] = df[c].astype(str).str.strip()
+            df[c] = df[c].astype(str).str.strip().str.lower()
 
-    print(f"  Loaded {len(df):,} rows")
+    print("Ensuring gen_tokens column...")
+    df = ensure_gen_tokens(df)
 
-    # Infer gen_tokens and filter
-    print("Inferring gen_tokens per run...")
-    df = infer_gen_tokens(df)
+    # Filter to valid decode tokens
     df = df[(df["token_index"] >= 0) & (df["token_index"] < df["gen_tokens"])].copy()
-    print(f"  Retained {len(df):,} valid decode tokens")
+    print(f"  Retained {len(df)} valid decode tokens")
 
-    # Compute matched per-token speedups
     print("Computing matched per-token speedups (nano/tau)...")
     sp = compute_matched_speedups(df)
-    sp["rel_pos"] = sp["token_index"] / sp["gen_tokens"]
-    sp["pos_bin"] = pd.cut(
-        sp["rel_pos"].clip(0, 1),
-        bins=POS_BINS,
-        labels=POS_BIN_LABELS,
+
+    # Add position bins
+    sp["relpos"] = sp["token_index"] / sp["gen_tokens"]
+    sp["posbin"] = pd.cut(
+        sp["relpos"].clip(0, 1),
+        bins=POSBINS,
+        labels=POSBINLABELS,
         include_lowest=True,
         right=True,
     )
-    print(f"  Matched {len(sp):,} token pairs")
+    print(f"  Matched {len(sp)} token pairs")
 
     summary = summarize_speedups(sp)
     summary.to_csv(os.path.join(args.outdir, "speedup_summary.csv"), index=False)
@@ -488,28 +494,28 @@ def main():
     )
     print(f"  Wrote speedup_by_posbin.csv ({len(speedup_posbin)} rows)")
 
-    # Plots with evidence + extrapolation
-    print("Generating plots...")
-    plot_speedup_vs_gen(summary, args.outdir, args.max_gen_tokens)
+    print("\nGenerating plots...")
+    plot_speedup_vs_gen(summary, args.outdir, args.maxgentokens)
     plot_speedup_by_posbin(speedup_posbin, args.outdir)
 
-    # Clustering runs by distribution features
-    print("Clustering runs by latency distribution features...")
+    print("\nClustering runs by latency distribution features...")
     run_feat = compute_run_features(df)
     run_feat.to_csv(os.path.join(args.outdir, "run_features.csv"), index=False)
     print(f"  Computed features for {len(run_feat)} runs")
 
-    run_clusters = cluster_runs(run_feat, k=args.clusters_k, seed=args.seed)
+    run_clusters = cluster_runs(run_feat, k=args.clustersk, seed=args.seed)
     run_clusters.to_csv(os.path.join(args.outdir, "run_clusters.csv"), index=False)
-    print(f"  Clustered into {args.clusters_k} groups")
+    print(f"  Clustered into {args.clustersk} groups")
 
     plot_cluster_scatter(run_clusters, args.outdir)
 
-    print(f"\n✓ All outputs written to: {args.outdir}/")
+    print(f"\n{'=' * 70}")
+    print(f"All outputs written to {args.outdir}")
+    print(f"{'=' * 70}")
     print("Key files:")
-    print("  - speedup_vs_gen_tokens.png (evidence + extrapolation)")
-    print("  - speedup_by_relpos_bins.png (late-token behavior)")
-    print("  - run_clusters_pca.png (distribution clustering)")
+    print("  - speedup_vs_gentokens.png: evidence + extrapolation")
+    print("  - speedup_by_relpos_bins.png: late-token behavior")
+    print("  - run_clusters_pca.png: distribution clustering")
     print("  - speedup_summary.csv, speedup_by_posbin.csv")
     print("  - run_features.csv, run_clusters.csv, run_cluster_counts.csv")
 
