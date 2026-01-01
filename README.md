@@ -32,6 +32,10 @@ RUST_LOG=info cargo run --release --   --prompts ./prompts.jsonl   --gen-tokens 
 
 
 ```
+# aggregate results
+$ python analysis/aggregation_analysis.py --root output/ --out report/aggregation
+# plot
 $ python analysis/all_tokens_latencies.py   --token_csv report/tokenlatencies__normalized.csv   --outdir plots_tokenlat
+# extrapolate
 $ python analysis/extrapolate_tau_speedup.py   --pairwise_csv report/tau_vs_nano__pairwise_speedups.csv   --outdir plots_extrapolation   --max_gen_tokens 1000000   --max_prompt_len 1000000
 ```

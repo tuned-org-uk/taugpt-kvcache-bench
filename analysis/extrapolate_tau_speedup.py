@@ -461,7 +461,7 @@ def plot_prompt_len_speedup(df: pd.DataFrame, outdir: str, max_prompt: int = 1_0
         fontweight="bold",
     )
     ax.set_title(
-        "Tau Speedup vs Embedding Dimension (prompt_len)\n"
+        "Tau Speedup vs Number of ids in the prompt (prompt_len)\n"
         "kv_cache vs no_cache • Extrapolated to 1M dimensions",
         fontsize=15,
         fontweight="bold",
@@ -494,7 +494,7 @@ def plot_prompt_len_speedup(df: pd.DataFrame, outdir: str, max_prompt: int = 1_0
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Tau speedup extrapolation to 1M context/dimensions (kv_cache + no_cache)"
+        description="Tau speedup extrapolation to 1M context/token ids (kv_cache + no_cache)"
     )
     ap.add_argument(
         "--pairwise_csv",

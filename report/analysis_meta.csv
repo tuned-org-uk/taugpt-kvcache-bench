@@ -1,0 +1,2 @@
+runs_agg_rows,pairwise_rows,cache_rows,runs_norm_rows,token_rows,gen_tokens_values,modes,engines,prompt_lens,kv_tps_speedup_fit_intercept,kv_tps_speedup_fit_slope_per_token,kv_tps_speedup_crossover_gen_tokens_est
+28,14,14,252,4608,"[128, 256, 512, 1024]","['kv_cache', 'no_cache']","['nano', 'tau']",[384],1.1272330556166035,0.00015400354130929225,-826.169674638037
