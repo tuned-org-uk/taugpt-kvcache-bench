@@ -1,19 +1,37 @@
-* Run both NanoGPT and TauGPT: single-head "manifold native"
+# taugpt-kvcache-bench
+
+Faster Domain-driven KV-cache for the transformer architecture thanks to taumode (`arrowspace-rs`).
+
+## Assumptions of comparison
+
+* "no_cache" mode is full forward / training-like proxy (dense dot-product vs lambda-distance) without mixing in cache behavior.
+* "kv_cache" mode is a clean inference-like proxy with three phases:
+  * `prefill_ms` = build cache from prompt (decode-priming)
+  * `ttft_ms` = first generated token
+  * `decode_total_ms` = steady-state decode loop
+* `end_to_end_ms` gives a single number to optimise for serving, while still letting inspect phase breakdowns.
+
+## Build
 ```
-cargo run --release -- \
-  --prompts ./prompts.jsonl \
-  --max-new-tokens 128 \
-  --repeats 5 \
-  --warmup 1 \
-  --runs-csv runs.csv \
-  --token-csv token_latencies.csv \
-  --run-tau \
-  --manifold ./domain_manifold/manifold.parquet \
-  --tau-mode median \
-  --n-head 1 \
-  --n-kv-head 1 \
-  --n-layer 6
+# for CPU
+cargo build --release
+# or
+cargo build --release --features wgpu
+# or
+cargo build --release --features cuda
 ```
 
-* Run same but "native multi-head"
---n-head 2 --n-kv-head 1
+## Usage
+* Run both NanoGPT and TauGPT: multi-head "manifold native" (check defaults in `main.rs`)
+```
+RUST_LOG=info cargo run --release --   --prompts ./prompts.jsonl   --gen-tokens 2048
+```
+
+
+## Run analysis
+
+
+```
+$ python analysis/all_tokens_latencies.py   --token_csv report/tokenlatencies__normalized.csv   --outdir plots_tokenlat
+$ python analysis/extrapolate_tau_speedup.py   --pairwise_csv report/tau_vs_nano__pairwise_speedups.csv   --outdir plots_extrapolation   --max_gen_tokens 1000000   --max_prompt_len 1000000
+```

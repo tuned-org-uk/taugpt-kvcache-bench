@@ -663,6 +663,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a0d9909ff711c13a416a5212111a6c85defce9a5e194752a012e79b27a107f9"
 dependencies = [
  "burn-cubecl",
+ "burn-fusion",
  "burn-tensor",
  "bytemuck",
  "cubecl",
@@ -4038,6 +4039,7 @@ dependencies = [
  "arrow",
  "arrowspace",
  "burn",
+ "burn-cuda",
  "burn-ndarray",
  "burn-wgpu",
  "env_logger",
