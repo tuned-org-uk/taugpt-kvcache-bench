@@ -1,0 +1,15 @@
+cluster,engine,mode,runs
+0,nano,kv_cache,48
+0,nano,no_cache,36
+0,tau,kv_cache,48
+0,tau,no_cache,36
+1,nano,no_cache,3
+1,tau,no_cache,3
+2,nano,no_cache,3
+2,tau,no_cache,3
+3,nano,no_cache,2
+3,tau,no_cache,2
+4,nano,no_cache,3
+4,tau,no_cache,3
+5,nano,no_cache,1
+5,tau,no_cache,1
