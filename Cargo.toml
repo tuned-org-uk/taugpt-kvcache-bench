@@ -15,7 +15,7 @@ sysinfo = "0.33"
 cpu-time = "1"
 rand = "0.8"
 burn = { version = "0.18.0", default-features = false, features = ["std", "train"] }
-tauformer = { version = "0.1.0", path = "../tauformer", default-features = false }
+tauformer = { version = "0.2.0" }
 sprs = "0.11"
 
 [features]
